@@ -22,6 +22,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.testcontainers.shaded.org.awaitility.Awaitility.await;
 
+import io.awspring.cloud.autoconfigure.AwsSyncClientCustomizer;
 import io.awspring.cloud.autoconfigure.ConfiguredAwsClient;
 import java.io.IOException;
 import java.time.Duration;
@@ -59,6 +60,7 @@ import software.amazon.awssdk.services.ssm.model.ParameterType;
  * Integration tests for loading configuration properties from AWS Parameter Store.
  *
  * @author Maciej Walkowiak
+ * @author Matej Nedic
  */
 @Testcontainers
 @ExtendWith(OutputCaptureExtension.class)
@@ -69,7 +71,7 @@ class ParameterStoreConfigDataLoaderIntegrationTests {
 
 	@Container
 	static LocalStackContainer localstack = new LocalStackContainer(
-			DockerImageName.parse("localstack/localstack:2.3.2")).withReuse(true);
+			DockerImageName.parse("localstack/localstack:3.8.1"));
 
 	@BeforeAll
 	static void beforeAll() {
@@ -88,6 +90,22 @@ class ParameterStoreConfigDataLoaderIntegrationTests {
 			assertThat(context.getEnvironment().getProperty("message")).isEqualTo("value from tests");
 			assertThat(context.getEnvironment().getProperty("another-parameter")).isEqualTo("another parameter value");
 			assertThat(context.getEnvironment().getProperty("non-existing-parameter")).isNull();
+		}
+	}
+
+	@Test
+	void propertyIsNotResolvedWhenIntegrationIsDisabled() {
+		SpringApplication application = new SpringApplication(ParameterStoreConfigDataLoaderIntegrationTests.App.class);
+		application.setWebApplicationType(WebApplicationType.NONE);
+
+		try (ConfigurableApplicationContext context = application.run(
+				"--spring.config.import=aws-parameterstore:/config/spring/",
+				"--spring.cloud.aws.parameterstore.enabled=false", "--spring.cloud.aws.credentials.secret-key=noop",
+				"--spring.cloud.aws.endpoint=" + localstack.getEndpoint(),
+				"--spring.cloud.aws.credentials.access-key=noop", "--spring.cloud.aws.credentials.secret-key=noop",
+				"--spring.cloud.aws.region.static=eu-west-1")) {
+			assertThat(context.getEnvironment().getProperty("message")).isNull();
+			assertThat(context.getBeanProvider(SsmClient.class).getIfAvailable()).isNull();
 		}
 	}
 
@@ -117,6 +135,20 @@ class ParameterStoreConfigDataLoaderIntegrationTests {
 				"aws-parameterstore:/config/spring/")) {
 			ConfiguredAwsClient ssmClient = new ConfiguredAwsClient(context.getBean(SsmClient.class));
 			assertThat(ssmClient.getApiCallTimeout()).isEqualTo(Duration.ofMillis(2828));
+			assertThat(ssmClient.getSyncHttpClient()).isNotNull();
+		}
+	}
+
+	@Test
+	void clientIsConfiguredWithCustomizerProvidedToBootstrapRegistry() {
+		SpringApplication application = new SpringApplication(App.class);
+		application.setWebApplicationType(WebApplicationType.NONE);
+		application.addBootstrapRegistryInitializer(new CustomizerConfiguration());
+
+		try (ConfigurableApplicationContext context = runApplication(application,
+				"aws-parameterstore:/config/spring/")) {
+			ConfiguredAwsClient ssmClient = new ConfiguredAwsClient(context.getBean(SsmClient.class));
+			assertThat(ssmClient.getApiCallTimeout()).isEqualTo(Duration.ofMillis(2001));
 			assertThat(ssmClient.getSyncHttpClient()).isNotNull();
 		}
 	}
@@ -431,6 +463,21 @@ class ParameterStoreConfigDataLoaderIntegrationTests {
 							return ApacheHttpClient.builder().connectionTimeout(Duration.ofMillis(1542)).build();
 						}
 					});
+		}
+	}
+
+	static class CustomizerConfiguration implements BootstrapRegistryInitializer {
+
+		@Override
+		public void initialize(BootstrapRegistry registry) {
+			registry.register(SsmClientCustomizer.class, context -> (builder -> {
+				builder.overrideConfiguration(builder.overrideConfiguration().copy(c -> {
+					c.apiCallTimeout(Duration.ofMillis(2001));
+				}));
+			}));
+			registry.register(AwsSyncClientCustomizer.class, context -> (builder -> {
+				builder.httpClient(ApacheHttpClient.builder().connectionTimeout(Duration.ofMillis(1542)).build());
+			}));
 		}
 	}
 

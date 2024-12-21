@@ -15,6 +15,7 @@
  */
 package io.awspring.cloud.autoconfigure.config.secretsmanager;
 
+import io.awspring.cloud.autoconfigure.AwsSyncClientCustomizer;
 import io.awspring.cloud.autoconfigure.config.AbstractAwsConfigDataLocationResolver;
 import io.awspring.cloud.autoconfigure.core.AwsClientCustomizer;
 import io.awspring.cloud.autoconfigure.core.AwsProperties;
@@ -62,25 +63,35 @@ public class SecretsManagerConfigDataLocationResolver
 	public List<SecretsManagerConfigDataResource> resolve(ConfigDataLocationResolverContext resolverContext,
 			ConfigDataLocation location)
 			throws ConfigDataLocationNotFoundException, ConfigDataResourceNotFoundException {
-		registerBean(resolverContext, AwsProperties.class, loadAwsProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, SecretsManagerProperties.class, loadProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, CredentialsProperties.class,
-				loadCredentialsProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, RegionProperties.class, loadRegionProperties(resolverContext.getBinder()));
-
-		registerAndPromoteBean(resolverContext, SecretsManagerClient.class, this::createAwsSecretsManagerClient);
-
-		SecretsManagerPropertySources propertySources = new SecretsManagerPropertySources();
+		SecretsManagerProperties secretsManagerProperties = loadProperties(resolverContext.getBinder());
 
 		List<String> contexts = getCustomContexts(location.getNonPrefixedValue(PREFIX));
-
 		List<SecretsManagerConfigDataResource> locations = new ArrayList<>();
-		contexts.forEach(propertySourceContext -> locations.add(
-				new SecretsManagerConfigDataResource(propertySourceContext, location.isOptional(), propertySources)));
+		SecretsManagerPropertySources propertySources = new SecretsManagerPropertySources();
 
-		if (!location.isOptional() && locations.isEmpty()) {
-			throw new SecretsManagerKeysMissingException(
-					"No Secrets Manager keys provided in `spring.config.import=aws-secretsmanager:` configuration.");
+		if (secretsManagerProperties.isEnabled()) {
+			registerBean(resolverContext, AwsProperties.class, loadAwsProperties(resolverContext.getBinder()));
+			registerBean(resolverContext, SecretsManagerProperties.class, secretsManagerProperties);
+			registerBean(resolverContext, CredentialsProperties.class,
+					loadCredentialsProperties(resolverContext.getBinder()));
+			registerBean(resolverContext, RegionProperties.class, loadRegionProperties(resolverContext.getBinder()));
+			registerAndPromoteBean(resolverContext, SecretsManagerClient.class, this::createAwsSecretsManagerClient);
+
+			contexts.forEach(
+					propertySourceContext -> locations.add(new SecretsManagerConfigDataResource(propertySourceContext,
+							location.isOptional(), propertySources)));
+
+			if (!location.isOptional() && locations.isEmpty()) {
+				throw new SecretsManagerKeysMissingException(
+						"No Secrets Manager keys provided in `spring.config.import=aws-secretsmanager:` configuration.");
+			}
+		}
+		else {
+			// create dummy resources with enabled flag set to false,
+			// because returned locations cannot be empty
+			contexts.forEach(
+					propertySourceContext -> locations.add(new SecretsManagerConfigDataResource(propertySourceContext,
+							location.isOptional(), false, propertySources)));
 		}
 
 		return locations;
@@ -96,8 +107,30 @@ public class SecretsManagerConfigDataLocationResolver
 			}
 		}
 		catch (IllegalStateException e) {
-			log.debug("Bean of type AwsClientConfigurerSecretsManager is not registered: " + e.getMessage());
+			log.debug("Bean of type AwsParameterStoreClientCustomizer is not registered: " + e.getMessage());
 		}
+
+		try {
+			AwsSyncClientCustomizer awsSyncClientCustomizer = context.get(AwsSyncClientCustomizer.class);
+			if (awsSyncClientCustomizer != null) {
+				awsSyncClientCustomizer.customize(builder);
+			}
+		}
+		catch (IllegalStateException e) {
+			log.debug("Bean of type AwsSyncClientCustomizer is not registered: " + e.getMessage());
+		}
+
+		try {
+			SecretsManagerClientCustomizer secretsManagerClientCustomizer = context
+					.get(SecretsManagerClientCustomizer.class);
+			if (secretsManagerClientCustomizer != null) {
+				secretsManagerClientCustomizer.customize(builder);
+			}
+		}
+		catch (IllegalStateException e) {
+			log.debug("Bean of type SecretsManagerClientCustomizer is not registered: " + e.getMessage());
+		}
+
 		return builder.build();
 	}
 

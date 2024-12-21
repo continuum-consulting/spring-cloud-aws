@@ -16,8 +16,10 @@
 package io.awspring.cloud.autoconfigure.s3;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.awspring.cloud.autoconfigure.AwsSyncClientCustomizer;
 import io.awspring.cloud.autoconfigure.core.AwsClientBuilderConfigurer;
 import io.awspring.cloud.autoconfigure.core.AwsClientCustomizer;
+import io.awspring.cloud.autoconfigure.core.AwsConnectionDetails;
 import io.awspring.cloud.autoconfigure.core.AwsProperties;
 import io.awspring.cloud.autoconfigure.s3.properties.S3Properties;
 import io.awspring.cloud.s3.InMemoryBufferingS3OutputStreamProvider;
@@ -29,30 +31,31 @@ import io.awspring.cloud.s3.S3Operations;
 import io.awspring.cloud.s3.S3OutputStreamProvider;
 import io.awspring.cloud.s3.S3ProtocolResolver;
 import io.awspring.cloud.s3.S3Template;
-import io.awspring.cloud.s3.crossregion.CrossRegionS3Client;
 import java.util.Optional;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
-import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingClass;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.*;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.context.properties.PropertyMapper;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+import org.springframework.util.ClassUtils;
+import org.springframework.util.StringUtils;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.regions.providers.AwsRegionProvider;
+import software.amazon.awssdk.s3accessgrants.plugin.S3AccessGrantsPlugin;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.encryption.s3.S3EncryptionClient;
 
 /**
- * {@link EnableAutoConfiguration} for {@link S3Client} and {@link S3ProtocolResolver}.
+ * {@link AutoConfiguration} for {@link S3Client} and {@link S3ProtocolResolver}.
  *
  * @author Maciej Walkowiak
+ * @author Matej Nedic
  */
 @AutoConfiguration
 @ConditionalOnClass({ S3Client.class, S3OutputStreamProvider.class })
@@ -70,9 +73,19 @@ public class S3AutoConfiguration {
 	@Bean
 	@ConditionalOnMissingBean
 	S3ClientBuilder s3ClientBuilder(AwsClientBuilderConfigurer awsClientBuilderConfigurer,
-			ObjectProvider<AwsClientCustomizer<S3ClientBuilder>> configurer) {
-		S3ClientBuilder builder = awsClientBuilderConfigurer.configure(S3Client.builder(), this.properties,
-				configurer.getIfAvailable());
+			ObjectProvider<AwsClientCustomizer<S3ClientBuilder>> configurer,
+			ObjectProvider<AwsConnectionDetails> connectionDetails,
+			ObjectProvider<S3ClientCustomizer> s3ClientCustomizers,
+			ObjectProvider<AwsSyncClientCustomizer> awsSyncClientCustomizers) {
+		S3ClientBuilder builder = awsClientBuilderConfigurer.configureSyncClient(S3Client.builder(), this.properties,
+				connectionDetails.getIfAvailable(), configurer.getIfAvailable(), s3ClientCustomizers.orderedStream(),
+				awsSyncClientCustomizers.orderedStream());
+
+		if (ClassUtils.isPresent("software.amazon.awssdk.s3accessgrants.plugin.S3AccessGrantsPlugin", null)) {
+			S3AccessGrantsPlugin s3AccessGrantsPlugin = S3AccessGrantsPlugin.builder()
+					.enableFallback(properties.getPlugin().getEnableFallback()).build();
+			builder.addPlugin(s3AccessGrantsPlugin);
+		}
 
 		Optional.ofNullable(this.properties.getCrossRegionEnabled()).ifPresent(builder::crossRegionAccessEnabled);
 
@@ -91,10 +104,11 @@ public class S3AutoConfiguration {
 	@Bean
 	@ConditionalOnMissingBean
 	S3Presigner s3Presigner(S3Properties properties, AwsProperties awsProperties,
-			AwsCredentialsProvider credentialsProvider, AwsRegionProvider regionProvider) {
+			AwsCredentialsProvider credentialsProvider, AwsRegionProvider regionProvider,
+			ObjectProvider<AwsConnectionDetails> connectionDetails) {
 		S3Presigner.Builder builder = S3Presigner.builder().serviceConfiguration(properties.toS3Configuration())
-				.credentialsProvider(credentialsProvider)
-				.region(AwsClientBuilderConfigurer.resolveRegion(properties, regionProvider));
+				.credentialsProvider(credentialsProvider).region(AwsClientBuilderConfigurer.resolveRegion(properties,
+						connectionDetails.getIfAvailable(), regionProvider));
 
 		if (properties.getEndpoint() != null) {
 			builder.endpointOverride(properties.getEndpoint());
@@ -107,28 +121,69 @@ public class S3AutoConfiguration {
 		return builder.build();
 	}
 
-	@Configuration(proxyBeanMethods = false)
-	@ConditionalOnClass(CrossRegionS3Client.class)
-	static class CrossRegionS3ClientConfiguration {
+	@Conditional(S3EncryptionConditional.class)
+	@ConditionalOnClass(name = "software.amazon.encryption.s3.S3EncryptionClient")
+	@Configuration
+	public static class S3EncryptionConfiguration {
 
 		@Bean
 		@ConditionalOnMissingBean
-		S3Client s3Client(S3ClientBuilder s3ClientBuilder) {
-			return new CrossRegionS3Client(s3ClientBuilder);
+		S3Client s3EncryptionClient(S3EncryptionClient.Builder s3EncryptionBuilder, S3ClientBuilder s3ClientBuilder) {
+			s3EncryptionBuilder.wrappedClient(s3ClientBuilder.build());
+			return s3EncryptionBuilder.build();
 		}
 
+		@Bean
+		@ConditionalOnMissingBean
+		S3EncryptionClient.Builder s3EncrpytionClientBuilder(S3Properties properties,
+				AwsClientBuilderConfigurer awsClientBuilderConfigurer,
+				ObjectProvider<AwsClientCustomizer<S3EncryptionClient.Builder>> configurer,
+				ObjectProvider<AwsConnectionDetails> connectionDetails,
+				ObjectProvider<S3EncryptionClientCustomizer> s3ClientCustomizers,
+				ObjectProvider<AwsSyncClientCustomizer> awsSyncClientCustomizers,
+				ObjectProvider<S3RsaProvider> rsaProvider, ObjectProvider<S3AesProvider> aesProvider) {
+			S3EncryptionClient.Builder builder = awsClientBuilderConfigurer.configureSyncClient(
+					S3EncryptionClient.builder(), properties, connectionDetails.getIfAvailable(),
+					configurer.getIfAvailable(), s3ClientCustomizers.orderedStream(),
+					awsSyncClientCustomizers.orderedStream());
+
+			Optional.ofNullable(properties.getCrossRegionEnabled()).ifPresent(builder::crossRegionAccessEnabled);
+			builder.serviceConfiguration(properties.toS3Configuration());
+
+			configureEncryptionProperties(properties, rsaProvider, aesProvider, builder);
+			return builder;
+		}
+
+		private static void configureEncryptionProperties(S3Properties properties,
+				ObjectProvider<S3RsaProvider> rsaProvider, ObjectProvider<S3AesProvider> aesProvider,
+				S3EncryptionClient.Builder builder) {
+			PropertyMapper propertyMapper = PropertyMapper.get();
+			var encryptionProperties = properties.getEncryption();
+
+			propertyMapper.from(encryptionProperties::isEnableDelayedAuthenticationMode)
+					.to(builder::enableDelayedAuthenticationMode);
+			propertyMapper.from(encryptionProperties::isEnableLegacyUnauthenticatedModes)
+					.to(builder::enableLegacyUnauthenticatedModes);
+			propertyMapper.from(encryptionProperties::isEnableMultipartPutObject).to(builder::enableMultipartPutObject);
+
+			if (!StringUtils.hasText(properties.getEncryption().getKeyId())) {
+				if (aesProvider.getIfAvailable() != null) {
+					builder.aesKey(aesProvider.getObject().generateSecretKey());
+				}
+				else {
+					builder.rsaKeyPair(rsaProvider.getObject().generateKeyPair());
+				}
+			}
+			else {
+				propertyMapper.from(encryptionProperties::getKeyId).to(builder::kmsKeyId);
+			}
+		}
 	}
 
-	@Configuration(proxyBeanMethods = false)
-	@ConditionalOnMissingClass("io.awspring.cloud.s3.crossregion.CrossRegionS3Client")
-	static class StandardS3ClientConfiguration {
-
-		@Bean
-		@ConditionalOnMissingBean
-		S3Client s3Client(S3ClientBuilder s3ClientBuilder) {
-			return s3ClientBuilder.build();
-		}
-
+	@Bean
+	@ConditionalOnMissingBean
+	S3Client s3Client(S3ClientBuilder s3ClientBuilder) {
+		return s3ClientBuilder.build();
 	}
 
 	@Configuration
@@ -149,5 +204,4 @@ public class S3AutoConfiguration {
 		return new InMemoryBufferingS3OutputStreamProvider(s3Client,
 				contentTypeResolver.orElseGet(PropertiesS3ObjectContentTypeResolver::new));
 	}
-
 }

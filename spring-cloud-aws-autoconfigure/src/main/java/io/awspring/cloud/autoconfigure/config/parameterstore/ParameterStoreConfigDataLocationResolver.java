@@ -15,6 +15,7 @@
  */
 package io.awspring.cloud.autoconfigure.config.parameterstore;
 
+import io.awspring.cloud.autoconfigure.AwsSyncClientCustomizer;
 import io.awspring.cloud.autoconfigure.config.AbstractAwsConfigDataLocationResolver;
 import io.awspring.cloud.autoconfigure.core.AwsClientCustomizer;
 import io.awspring.cloud.autoconfigure.core.AwsProperties;
@@ -36,6 +37,7 @@ import software.amazon.awssdk.services.ssm.SsmClientBuilder;
 
 /**
  * @author Eddú Meléndez
+ * @author Matej Nedic
  * @since 2.3.0
  */
 public class ParameterStoreConfigDataLocationResolver
@@ -61,25 +63,33 @@ public class ParameterStoreConfigDataLocationResolver
 	public List<ParameterStoreConfigDataResource> resolveProfileSpecific(
 			ConfigDataLocationResolverContext resolverContext, ConfigDataLocation location, Profiles profiles)
 			throws ConfigDataLocationNotFoundException {
-		registerBean(resolverContext, AwsProperties.class, loadAwsProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, ParameterStoreProperties.class, loadProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, CredentialsProperties.class,
-				loadCredentialsProperties(resolverContext.getBinder()));
-		registerBean(resolverContext, RegionProperties.class, loadRegionProperties(resolverContext.getBinder()));
-
-		registerAndPromoteBean(resolverContext, SsmClient.class, this::createSimpleSystemManagementClient);
-
+		var properties = loadProperties(resolverContext.getBinder());
+		List<ParameterStoreConfigDataResource> locations = new ArrayList<>();
 		ParameterStorePropertySources sources = new ParameterStorePropertySources();
-
 		List<String> contexts = getCustomContexts(location.getNonPrefixedValue(PREFIX));
 
-		List<ParameterStoreConfigDataResource> locations = new ArrayList<>();
-		contexts.forEach(propertySourceContext -> locations
-				.add(new ParameterStoreConfigDataResource(propertySourceContext, location.isOptional(), sources)));
+		if (properties.isEnabled()) {
+			registerBean(resolverContext, AwsProperties.class, loadAwsProperties(resolverContext.getBinder()));
+			registerBean(resolverContext, ParameterStoreProperties.class, properties);
+			registerBean(resolverContext, CredentialsProperties.class,
+					loadCredentialsProperties(resolverContext.getBinder()));
+			registerBean(resolverContext, RegionProperties.class, loadRegionProperties(resolverContext.getBinder()));
 
-		if (!location.isOptional() && locations.isEmpty()) {
-			throw new ParameterStoreKeysMissingException(
-					"No Parameter Store keys provided in `spring.config.import=aws-parameterstore:` configuration.");
+			registerAndPromoteBean(resolverContext, SsmClient.class, this::createSimpleSystemManagementClient);
+			contexts.forEach(propertySourceContext -> locations
+					.add(new ParameterStoreConfigDataResource(propertySourceContext, location.isOptional(), sources)));
+
+			if (!location.isOptional() && locations.isEmpty()) {
+				throw new ParameterStoreKeysMissingException(
+						"No Parameter Store keys provided in `spring.config.import=aws-parameterstore:` configuration.");
+			}
+		}
+		else {
+			// create dummy resources with enabled flag set to false,
+			// because returned locations cannot be empty
+			contexts.forEach(
+					propertySourceContext -> locations.add(new ParameterStoreConfigDataResource(propertySourceContext,
+							location.isOptional(), false, sources)));
 		}
 		return locations;
 	}
@@ -93,8 +103,29 @@ public class ParameterStoreConfigDataLocationResolver
 			}
 		}
 		catch (IllegalStateException e) {
-			log.debug("Bean of type AwsClientConfigurerParameterStore is not registered: " + e.getMessage());
+			log.debug("Bean of type AwsParameterStoreClientCustomizer is not registered: " + e.getMessage());
 		}
+
+		try {
+			AwsSyncClientCustomizer awsSyncClientCustomizer = context.get(AwsSyncClientCustomizer.class);
+			if (awsSyncClientCustomizer != null) {
+				awsSyncClientCustomizer.customize(builder);
+			}
+		}
+		catch (IllegalStateException e) {
+			log.debug("Bean of type AwsSyncClientCustomizer is not registered: " + e.getMessage());
+		}
+
+		try {
+			SsmClientCustomizer ssmClientCustomizer = context.get(SsmClientCustomizer.class);
+			if (ssmClientCustomizer != null) {
+				ssmClientCustomizer.customize(builder);
+			}
+		}
+		catch (IllegalStateException e) {
+			log.debug("Bean of type SsmClientCustomizer is not registered: " + e.getMessage());
+		}
+
 		return builder.build();
 	}
 

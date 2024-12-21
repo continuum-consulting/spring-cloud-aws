@@ -22,6 +22,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.testcontainers.shaded.org.awaitility.Awaitility.await;
 
+import io.awspring.cloud.autoconfigure.AwsSyncClientCustomizer;
 import io.awspring.cloud.autoconfigure.ConfiguredAwsClient;
 import java.io.File;
 import java.io.IOException;
@@ -74,7 +75,7 @@ class SecretsManagerConfigDataLoaderIntegrationTests {
 
 	@Container
 	static LocalStackContainer localstack = new LocalStackContainer(
-			DockerImageName.parse("localstack/localstack:2.3.2")).withReuse(true);
+			DockerImageName.parse("localstack/localstack:3.8.1"));
 
 	@TempDir
 	static Path tokenTempDir;
@@ -194,6 +195,20 @@ class SecretsManagerConfigDataLoaderIntegrationTests {
 	}
 
 	@Test
+	void clientIsConfiguredWithCustomizerProvidedToBootstrapRegistry() {
+		SpringApplication application = new SpringApplication(App.class);
+		application.setWebApplicationType(WebApplicationType.NONE);
+		application.addBootstrapRegistryInitializer(new CustomizerConfiguration());
+
+		try (ConfigurableApplicationContext context = runApplication(application,
+				"aws-secretsmanager:/config/spring;/config/second")) {
+			ConfiguredAwsClient client = new ConfiguredAwsClient(context.getBean(SecretsManagerClient.class));
+			assertThat(client.getApiCallTimeout()).isEqualTo(Duration.ofMillis(2001));
+			assertThat(client.getSyncHttpClient()).isNotNull();
+		}
+	}
+
+	@Test
 	void whenKeysAreNotSpecifiedFailsWithHumanReadableFailureMessage(CapturedOutput output) {
 		SpringApplication application = new SpringApplication(App.class);
 		application.setWebApplicationType(WebApplicationType.NONE);
@@ -269,6 +284,22 @@ class SecretsManagerConfigDataLoaderIntegrationTests {
 		try (ConfigurableApplicationContext context = runApplication(application,
 				"aws-secretsmanager:/config/spring;/config/second", "spring.cloud.aws.endpoint")) {
 			assertThat(context.getEnvironment().getProperty("message")).isEqualTo("value from tests");
+		}
+	}
+
+	@Test
+	void propertyIsNotResolvedWhenIntegrationIsDisabled() {
+		SpringApplication application = new SpringApplication(SecretsManagerConfigDataLoaderIntegrationTests.App.class);
+		application.setWebApplicationType(WebApplicationType.NONE);
+
+		try (ConfigurableApplicationContext context = application.run(
+				"--spring.config.import=aws-secretsmanager:/config/spring;/config/second",
+				"--spring.cloud.aws.secretsmanager.enabled=false", "--spring.cloud.aws.credentials.secret-key=noop",
+				"--spring.cloud.aws.endpoint=" + localstack.getEndpoint(),
+				"--spring.cloud.aws.credentials.access-key=noop", "--spring.cloud.aws.credentials.secret-key=noop",
+				"--spring.cloud.aws.region.static=eu-west-1")) {
+			assertThat(context.getEnvironment().getProperty("message")).isNull();
+			assertThat(context.getBeanProvider(SecretsManagerClient.class).getIfAvailable()).isNull();
 		}
 	}
 
@@ -462,7 +493,6 @@ class SecretsManagerConfigDataLoaderIntegrationTests {
 	@SpringBootConfiguration
 	@EnableAutoConfiguration
 	static class App {
-
 	}
 
 	static class AwsConfigurerClientConfiguration implements BootstrapRegistryInitializer {
@@ -483,6 +513,21 @@ class SecretsManagerConfigDataLoaderIntegrationTests {
 							return ApacheHttpClient.builder().connectionTimeout(Duration.ofMillis(1542)).build();
 						}
 					});
+		}
+	}
+
+	static class CustomizerConfiguration implements BootstrapRegistryInitializer {
+
+		@Override
+		public void initialize(BootstrapRegistry registry) {
+			registry.register(SecretsManagerClientCustomizer.class, context -> (builder -> {
+				builder.overrideConfiguration(builder.overrideConfiguration().copy(c -> {
+					c.apiCallTimeout(Duration.ofMillis(2001));
+				}));
+			}));
+			registry.register(AwsSyncClientCustomizer.class, context -> (builder -> {
+				builder.httpClient(ApacheHttpClient.builder().connectionTimeout(Duration.ofMillis(1542)).build());
+			}));
 		}
 	}
 
